@@ -144,7 +144,7 @@ function [N_s, Fx, Fy, F] = Compute(param, t_1_, t_2_, t_3)
         if flag == 0
             % build torque balance
             Tau_contacts = Jac.J1'*localParam.n1*N1 + Jac.J2'*localParam.n2*N2;
-            Tau_h = [0; localParam.K2*(localParam.t_2_ - localParam.l2_r)];
+            Tau_h = [0; -localParam.K2*(localParam.t_2_ - localParam.l2_r)];
             Tau_C = Jac.JC'*localParam.nC*F_cmp;
             EQ = Tau_contacts + Tau_h + Tau_C == 0;
             if any(isnan(Tau_C)) == 1 || any(isnan(Tau_contacts)) == 1 || any(isnan(Tau_h)) == 1
