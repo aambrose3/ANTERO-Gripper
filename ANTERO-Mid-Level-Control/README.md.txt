@@ -1,0 +1,1 @@
+This is a repository for the mid-level controller for the ANTERO Gripper. This repository depends on using the custom control board that interface an agnostic high-level controller with low-level motor controller on each ANTERO Finger.
