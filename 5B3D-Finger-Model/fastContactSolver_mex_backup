@@ -1,0 +1,347 @@
+#include "mex.h"
+#include "matrix.h"
+#include <math.h>
+#include <string.h>
+
+/* --- Helpers ------------------------------------------------------------ */
+
+static double norm2_4(const double v[4]) {
+    return sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2] + v[3]*v[3]);
+}
+
+static double norm2_n(const double *v, mwSize n) {
+    double s = 0.0;
+    for (mwSize i=0;i<n;++i) s += v[i]*v[i];
+    return sqrt(s);
+}
+
+/* Solve SPD 4x4: (A) x = b via Cholesky. A is row-major 4x4, overwritten. Returns 1 on success */
+static int solve_spd4(double A[16], const double b[4], double x[4]) {
+    double L[16];
+    for (int i=0;i<16;++i) L[i] = A[i];
+
+    for (int i=0;i<4;++i) {
+        for (int j=0;j<=i;++j) {
+            double sum = L[i*4 + j];
+            for (int k=0;k<j;++k) sum -= L[i*4 + k]*L[j*4 + k];
+            if (i==j) {
+                if (sum <= 0.0) return 0;
+                L[i*4 + j] = sqrt(sum);
+            } else {
+                L[i*4 + j] = sum / L[j*4 + j];
+            }
+        }
+        for (int j=i+1;j<4;++j) L[i*4 + j] = 0.0;
+    }
+
+    double y[4];
+    for (int i=0;i<4;++i) {
+        double sum = ((double[]){b[0],b[1],b[2],b[3]})[i];
+        for (int k=0;k<i;++k) sum -= L[i*4 + k]*y[k];
+        y[i] = sum / L[i*4 + i];
+    }
+    for (int i=3;i>=0;--i) {
+        double sum = y[i];
+        for (int k=i+1;k<4;++k) sum -= L[k*4 + i]*x[k];
+        x[i] = sum / L[i*4 + i];
+    }
+    return 1;
+}
+
+/* --- Residual ----------------------------------------------------------- */
+/* r = [E1;E2;E3;E4] for z=[p1 p2 a b], given scalars t1,t2,L,t,xc,yc0 */
+static void residual_only(const double z[4], double t1, double t2,
+                          double L, double t, double xc, double yc0,
+                          double r[4])
+{
+    const double p1=z[0], p2=z[1], a=z[2], b=z[3];
+
+    const double c1 = cos(t1),  s1 = sin(t1);
+    const double c12= cos(t1+t2), s12 = sin(t1+t2);
+
+    const double x1 = p1*c1 - t*sin(t1);
+    const double y1 = p1*s1 + t*c1;
+
+    const double x2 = L*c1 + p2*c12 - t*sin(t1+t2);
+    const double y2 = L*s1 + p2*s12 + t*c12;
+
+    const double yc = yc0 + b;
+    const double Y1 = y1 - yc;
+    const double Y2 = y2 - yc;
+
+    const double a2 = a*a, b2 = b*b;
+
+    r[0] = ((x1 - xc)*(x1 - xc))/a2 + (Y1*Y1)/b2 - 1.0;
+    r[1] = ((x2 - xc)*(x2 - xc))/a2 + (Y2*Y2)/b2 - 1.0;
+    r[2] = ((x1 - xc)/a2)*c1  + (Y1/b2)*s1;
+    r[3] = ((x2 - xc)/a2)*c12 + (Y2/b2)*s12;
+}
+
+/* --- One Newton solve (as in your MATLAB code) ------------------------- */
+static void newton_contact_one(double L, double t, double xc, double yc0,
+                               double t1, double t2, const double z0_in[4],
+                               double z_out[4], int *converged_out)
+{
+    const int maxIter = 250;
+    const double tolR = 1e-8;
+    const double tolStep = 1e-8;
+    const double EPS = 1e-8;
+
+    /* y = log(max(z0, EPS)) */
+    double y[4];
+    for (int i=0;i<4;++i) {
+        double v = z0_in[i] > EPS ? z0_in[i] : EPS;
+        y[i] = log(v);
+    }
+    int converged = 0;
+
+    for (int k=0; k<maxIter; ++k) {
+        double z[4] = { exp(y[0]), exp(y[1]), exp(y[2]), exp(y[3]) };
+        const double p1=z[0], p2=z[1], a=z[2], b=z[3];
+
+        const double c1 = cos(t1),  s1 = sin(t1);
+        const double c12= cos(t1+t2), s12 = sin(t1+t2);
+
+        const double x1 = p1*c1 - t*sin(t1);
+        const double y1p = p1*s1 + t*c1;
+
+        const double x2 = L*c1 + p2*c12 - t*sin(t1+t2);
+        const double y2p = L*s1 + p2*s12 + t*c12;
+
+        const double yc = yc0 + b;
+        const double Y1 = y1p - yc;
+        const double Y2 = y2p - yc;
+
+        const double a2=a*a, b2=b*b, a3=a2*a, b3=b2*b;
+
+        /* Residual */
+        double r[4];
+        r[0] = ((x1 - xc)*(x1 - xc))/a2 + (Y1*Y1)/b2 - 1.0;
+        r[1] = ((x2 - xc)*(x2 - xc))/a2 + (Y2*Y2)/b2 - 1.0;
+        r[2] = ((x1 - xc)/a2)*c1  + (Y1/b2)*s1;
+        r[3] = ((x2 - xc)/a2)*c12 + (Y2/b2)*s12;
+
+        if (norm2_4(r) < tolR) {
+            for (int i=0;i<4;++i) z_out[i] = z[i];
+            converged = 1;
+            break;
+        }
+
+        /* Analytic Jacobian Jz wrt z=[p1 p2 a b] */
+        const double dx1_dp1=c1, dy1_dp1=s1;
+        const double dx2_dp2=c12, dy2_dp2=s12;
+
+        double Jz[16] = {0};
+
+        /* dE1 */
+        Jz[0*4+0] = 2.0*(x1-xc)/a2 * dx1_dp1 + 2.0*Y1/b2 * dy1_dp1; /* dE1/dp1 */
+        Jz[0*4+1] = 0.0;                                             /* dE1/dp2 */
+        Jz[0*4+2] = -2.0*(x1-xc)*(x1-xc)/a3;                         /* dE1/da  */
+        Jz[0*4+3] = (-2.0*Y1)/b2 - 2.0*(Y1*Y1)/b3;                   /* dE1/db  */
+
+        /* dE2 */
+        Jz[1*4+0] = 0.0;
+        Jz[1*4+1] = 2.0*(x2-xc)/a2 * dx2_dp2 + 2.0*Y2/b2 * dy2_dp2;  /* dE2/dp2 */
+        Jz[1*4+2] = -2.0*(x2-xc)*(x2-xc)/a3;                         /* dE2/da  */
+        Jz[1*4+3] = (-2.0*Y2)/b2 - 2.0*(Y2*Y2)/b3;                   /* dE2/db  */
+
+        /* dE3 */
+        Jz[2*4+0] = (dx1_dp1/a2)*c1 + (dy1_dp1/b2)*s1;               /* dE3/dp1 */
+        Jz[2*4+1] = 0.0;
+        Jz[2*4+2] = -2.0*(x1-xc)/a3 * c1;                            /* dE3/da  */
+        Jz[2*4+3] = (-1.0/b2)*s1 + (-2.0*Y1/b3)*s1;                  /* dE3/db  */
+
+        /* dE4 */
+        Jz[3*4+0] = 0.0;
+        Jz[3*4+1] = (dx2_dp2/a2)*c12 + (dy2_dp2/b2)*s12;            /* dE4/dp2 */
+        Jz[3*4+2] = -2.0*(x2-xc)/a3 * c12;                          /* dE4/da  */
+        Jz[3*4+3] = (-1.0/b2)*s12 + (-2.0*Y2/b3)*s12;               /* dE4/db  */
+
+        /* Jy = Jz .* z.' (scale columns by z) */
+        double Jy[16];
+        for (int c=0;c<4;++c) {
+            const double s = z[c];
+            for (int r_=0;r_<4;++r_) Jy[r_*4 + c] = Jz[r_*4 + c]*s;
+        }
+
+        /* g = Jy' * r; H = Jy' * Jy */
+        double g[4] = {0,0,0,0};
+        double H[16] = {0};
+        for (int i=0;i<4;++i) {
+            double gi = 0.0;
+            for (int k=0;k<4;++k) gi += Jy[k*4 + i] * r[k];
+            g[i] = gi;
+            for (int j=i;j<4;++j) {
+                double hij = 0.0;
+                for (int k=0;k<4;++k) hij += Jy[k*4 + i] * Jy[k*4 + j];
+                H[i*4 + j] = hij;
+                H[j*4 + i] = hij;
+            }
+        }
+
+        /* mu = 1e-9 * (trace(H)/4 + 1) */
+        double tr = H[0] + H[5] + H[10] + H[15];
+        double mu = 1e-9 * (tr/4.0 + 1.0);
+        for (int d=0; d<4; ++d) H[d*4 + d] += mu;
+
+        /* Solve (H) dy = -g */
+        double rhs[4] = {-g[0], -g[1], -g[2], -g[3]};
+        double dy[4];
+        if (!solve_spd4(H, rhs, dy)) {
+            /* very rare; take tiny diagonal step */
+            for (int i=0;i<4;++i) {
+                double diag = (i==0?H[0]:(i==1?H[5]:(i==2?H[10]:H[15])));
+                dy[i] = -g[i] / (diag > 0 ? diag : 1.0);
+            }
+        }
+
+        /* Backtracking on ||r|| */
+        double step = 1.0;
+        const double c_armijo = 1e-4;
+        double rnorm = norm2_4(r);
+        for (int bt=0; bt<8; ++bt) {
+            double y_try[4];
+            for (int i=0;i<4;++i) y_try[i] = y[i] + step*dy[i];
+
+            double zt[4];
+            for (int i=0;i<4;++i) {
+                double v = exp(y_try[i]);
+                zt[i] = v > EPS ? v : EPS;
+            }
+
+            double rt[4];
+            residual_only(zt, t1, t2, L, t, xc, yc0, rt);
+
+            if (norm2_4(rt) < (1.0 - c_armijo*step)*rnorm) {
+                /* accept */
+                for (int i=0;i<4;++i) y[i] = log(zt[i]);
+                break;
+            } else {
+                step *= 0.5;
+            }
+        }
+
+        /* Step-size test */
+        double steplen2 = step*step*(dy[0]*dy[0] + dy[1]*dy[1] + dy[2]*dy[2] + dy[3]*dy[3]);
+        if (sqrt(steplen2) < tolStep) {
+            for (int i=0;i<4;++i) z_out[i] = exp(y[i]);
+            converged = 1; /* accept small step */
+            break;
+        }
+    }
+
+    if (!converged) {
+        for (int i=0;i<4;++i) z_out[i] = exp(y[i]); /* last iterate */
+    }
+    *converged_out = converged;
+}
+
+/* --- MEX Entry: [p1,p2,a,b] = fastContactsolver(param, t1, t2, z0?) ---- */
+void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
+{
+    if (nrhs < 3) {
+        mexErrMsgIdAndTxt("fastContactsolver:nrhs",
+                          "Need param, t1, t2 (and optional z0).");
+    }
+
+    /* param struct with fields a, t, O */
+    if (!mxIsStruct(prhs[0])) {
+        mexErrMsgIdAndTxt("fastContactsolver:param","param must be a struct.");
+    }
+    const mxArray *a_f = mxGetField(prhs[0],0,"a");
+    const mxArray *t_f = mxGetField(prhs[0],0,"t");
+    const mxArray *O_f = mxGetField(prhs[0],0,"O");
+    if (!a_f || !t_f || !O_f) {
+        mexErrMsgIdAndTxt("fastContactsolver:param",
+                          "param must have fields a, t, O.");
+    }
+    if (!mxIsDouble(a_f) || !mxIsDouble(t_f) || !mxIsDouble(O_f)) {
+        mexErrMsgIdAndTxt("fastContactsolver:param",
+                          "param.a, param.t, param.O must be double.");
+    }
+    if (mxGetNumberOfElements(O_f) != 2) {
+        mexErrMsgIdAndTxt("fastContactsolver:param",
+                          "param.O must have 2 elements [xc; yc0].");
+    }
+    const double L  = mxGetScalar(a_f);
+    const double t  = mxGetScalar(t_f);
+    const double *O = mxGetPr(O_f);
+    const double xc = O[0];
+    const double yc0= O[1];
+
+    /* t1, t2 must be vectors of equal length */
+    if (!mxIsDouble(prhs[1]) || !mxIsDouble(prhs[2])) {
+        mexErrMsgIdAndTxt("fastContactsolver:t","t1,t2 must be double.");
+    }
+    mwSize t1_m = mxGetM(prhs[1]), t1_n = mxGetN(prhs[1]);
+    mwSize t2_m = mxGetM(prhs[2]), t2_n = mxGetN(prhs[2]);
+    int t1_isvec = (t1_m == 1 || t1_n == 1);
+    int t2_isvec = (t2_m == 1 || t2_n == 1);
+    if (!t1_isvec || !t2_isvec) {
+        mexErrMsgIdAndTxt("fastContactsolver:t",
+                          "t1,t2 must be vectors of equal length.");
+    }
+    mwSize N1 = mxGetNumberOfElements(prhs[1]);
+    mwSize N2 = mxGetNumberOfElements(prhs[2]);
+    if (N1 != N2) {
+        mexErrMsgIdAndTxt("fastContactsolver:t",
+                          "t1,t2 must be vectors of equal length.");
+    }
+    mwSize N = N1;
+    const double *t1p = mxGetPr(prhs[1]);
+    const double *t2p = mxGetPr(prhs[2]);
+
+    /* z0 optional */
+    double z_prev[4];
+    if (nrhs < 4 || mxIsEmpty(prhs[3])) {
+        /* default: [0.02; 0.02; 0.03; 0.03] */
+        z_prev[0]=0.02; z_prev[1]=0.02; z_prev[2]=0.03; z_prev[3]=0.03;
+    } else {
+        if (!mxIsDouble(prhs[3]) || mxGetNumberOfElements(prhs[3])!=4) {
+            mexErrMsgIdAndTxt("fastContactsolver:z0",
+                              "z0 must be 4-element double vector.");
+        }
+        const double *z0p = mxGetPr(prhs[3]);
+        for (int i=0;i<4;++i) z_prev[i] = z0p[i];
+    }
+
+    /* Outputs p1,p2,a,b as N-by-1 */
+    plhs[0] = mxCreateDoubleMatrix(N,1,mxREAL);
+    plhs[1] = mxCreateDoubleMatrix(N,1,mxREAL);
+    plhs[2] = mxCreateDoubleMatrix(N,1,mxREAL);
+    plhs[3] = mxCreateDoubleMatrix(N,1,mxREAL);
+
+    double *p1_out = mxGetPr(plhs[0]);
+    double *p2_out = mxGetPr(plhs[1]);
+    double *a_out  = mxGetPr(plhs[2]);
+    double *b_out  = mxGetPr(plhs[3]);
+
+    /* Main loop (with warm start exactly like your MATLAB code) */
+    for (mwSize i=0; i<N; ++i) {
+        double zi[4];
+        int ok1 = 0;
+
+        newton_contact_one(L, t, xc, yc0, t1p[i], t2p[i], z_prev, zi, &ok1);
+        if (!ok1) {
+            /* fallback: z_reset = max([0.01;0.01;0.02;0.02], 0.5*z_prev + 0.5*[0.02;0.02;0.03;0.03]) */
+            const double base[4] = {0.01,0.01,0.02,0.02};
+            const double defg[4] = {0.02,0.02,0.03,0.03};
+            double z_reset[4];
+            for (int k=0;k<4;++k) {
+                double cand = 0.5*z_prev[k] + 0.5*defg[k];
+                z_reset[k] = (cand > base[k]) ? cand : base[k];
+            }
+            int ok2 = 0;
+            newton_contact_one(L, t, xc, yc0, t1p[i], t2p[i], z_reset, zi, &ok2);
+            /* last resort: accept zi regardless of ok2 (matches MATLAB comments) */
+        }
+
+        p1_out[i] = zi[0];
+        p2_out[i] = zi[1];
+        a_out[i]  = zi[2];
+        b_out[i]  = zi[3];
+
+        /* warm start next sample */
+        for (int k=0;k<4;++k) z_prev[k] = zi[k];
+    }
+}

@@ -24,11 +24,15 @@
 %   t_2_ -> angle \theta_2 (scalar)
 %   t_3_ -> angle \theta_3 (scalar)
 
+%% Change Log:
+%   Removed the WrapTo2Pi function calls to speed up symbolic expression
+%   math. This may result in ridiculous angles when going numeric and will
+%   then have to wrap to 2 pi.
 
 function param = updateParam(param, t_1_, t_2_, t_3_)
     param = param;
-    % [t_1_, t_2_] = meshgrid(t_1, t_2); % (r, c) = (t_2, t_1)
-    
+   
+    %% Estimation of the contact points (\pm 10% error)
     % These fitted functions come from the ../elipseSolver script
     % p1 = 14.4501062925132 + 28.6147335594148*t_1_ + 9.54112998810529*t_2_ + ...
     %     -14.3693994611985*t_1_.*t_2_ + 2.7779706576232*t_1_.^2 + ...
@@ -39,31 +43,41 @@ function param = updateParam(param, t_1_, t_2_, t_3_)
     %     16.0445700081864*t_1_.*t_2_ + -17.171428241453*t_1_.^2.*t_2_ + ...
     %     19.7847306722473*t_1_.*t_2_.^2;
     % p2 = p2/1000; % convert to m
-    [p1, p2, a, b] = contactSolver(param, t_1_, t_2_);
+
+    %% Analytical Solution for the contact locations
+    % tic
+    % [p1, p2, a, b] = contactSolver(param, t_1_, t_2_);
+    % fprintf('time elapsed: %.6f\n', toc)
+    %% Numeric Solution for the contact locations (460X faster than analytical with negligble error)
+    % tic
+    % [p1, p2, a, b] = fastContactSolver(param, t_1_, t_2_, [0.04, 0.04, 0.04, 0.04]);
+    [p1, p2, a, b] = fastContactSolverTesting(param, t_1_, t_2_, [0.04, 0.04, 0.04, 0.04]);
+    % fprintf('time elapsed: %.6f\n', toc)
+    %% Update the rest of the finger kinematic parameters
+    pC = param.a*[cos(t_1_)'; sin(t_1_)'] + ...
+        param.b*[cos(t_1_+t_2_-param.alpha)'; sin(t_1_+t_2_-param.alpha)']; % [x1;y1, x2;y2, ..., xn;yn];
     
-    pC = param.a*[cos(t_1_); sin(t_1_)] + ...
-        param.b*[cos(t_1_+t_2_-param.alpha); sin(t_1_+t_2_-param.alpha)];
-    
-    % g is onlt_2_ dependent on actuator angle (t_3_ is assumed to be a scalar)
-    g = sqrt(param.e^2 + param.d^2 - 2*param.e*param.d*cos(pi-param.gamma-t_3_)); 
-    tG = wrapTo2Pi(asin(param.d/g*sin(pi-param.gamma-t_3_)) - param.gamma);
+    % g is only dependent on actuator angle (t_3_ is assumed to be a scalar)
+    g = sqrt(param.e^2 + param.d.^2 - 2*param.e*param.d.*cos(pi-param.gamma-t_3_)); 
+    % tG = wrapTo2Pi(asin(param.d/g*sin(pi-param.gamma-t_3_)) - param.gamma);
+    tG = asin(param.d./g.*sin(pi-param.gamma-t_3_)) - param.gamma; %%%%%%%%%%% UNTESTED UNWRAPPED ANGLE %%%%%%%%%%%%%
     
     h = sqrt(param.a^2 + param.b^2 - 2*param.a*param.b*cos(pi-param.alpha+t_2_));
-    tH = wrapTo2Pi(t_1_ - asin(param.b./h.*sin(pi-param.alpha+t_2_)));
-    
+    % tH = wrapTo2Pi(t_1_ - asin(param.b./h.*sin(pi-param.alpha+t_2_)));
+    tH = t_1_ - asin(param.b./h.*sin(pi-param.alpha+t_2_)); %%%%%%%%%%% UNTESTED UNWRAPPED ANGLE %%%%%%%%%%%%%
     c = sqrt(g.^2 + h.^2 - 2*g.*h.*cos(tH-tG));
-    tC = pi + tG - asin(h./c.*sin(tH-tG));
+    tC = pi + tG - asin(h./c.*sin(tH-tG)); %%%%%%%%%%% UNTESTED UNWRAPPED ANGLE %%%%%%%%%%%%%
 
-    % contact force unit vectors
-    n1 = [cos(t_1_-pi/2); sin(t_1_-pi/2)];
-    n2 = [cos(t_1_+t_2_-pi/2); sin(t_1_+t_2_-pi/2)];
-    nC = [cos(tC); sin(tC)];
+    % contact force unit vectors: [x1;y1, x2;y2, ..., xn;yn];
+    n1 = [cos(t_1_-pi/2)'; sin(t_1_-pi/2)'];
+    n2 = [cos(t_1_+t_2_-pi/2)'; sin(t_1_+t_2_-pi/2)'];
+    nC = [cos(tC)'; sin(tC)'];
 
     param.t_1_ = t_1_;
     param.t_2_ = t_2_;
     param.p1 = p1;
     param.p2 = p2;
-    param.A = a; % ellipse axis lengths
+    param.A = a; % ellipse axis length. Not link length in this context
     param.B = b;
     param.pC = pC;
     param.g = g;

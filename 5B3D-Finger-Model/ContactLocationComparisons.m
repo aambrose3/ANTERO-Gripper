@@ -1,0 +1,80 @@
+clear; close all; clc;
+
+param = getParam;
+t1 = linspace(deg2rad(45), deg2rad(110), 101); t1 = t1(:);
+t2 = t1;
+temp = table2array(combinations(t1, t2));
+t1 = temp(:, 1); t2 = temp(:, 2);
+% for ii = 1:numel(t1)
+%     [p1(ii), p2(ii), a(ii), b(ii)] = fastContactSolverTesting(param, t1(ii), t2(ii), [0.02, 0.02, 0.03, 0.03]);
+% end
+[p1, p2, a, b] = fastContactSolverTesting(param, t1, t2, [0.04, 0.04, 0.035, 0.035]);
+
+
+%% Solve contact locations assuming a circular cross section
+syms x1 x2 x3 x4
+x = NaN*ones(4, numel(t1));
+parfor ii = 1:numel(t1)
+    param_ = param;
+    t1_ = t1(ii);
+    t2_ = t2(ii);
+    EQ1 = x1*cos(t1_) + param_.t*cos(t1_+pi/2) == x4 + 0 + x3*cos(t1_-pi/2);
+    EQ2 = x1*sin(t1_) + param_.t*sin(t1_+pi/2) == param_.O(2) + x3 + x3*sin(t1_-pi/2);
+
+    EQ3 = param_.a*cos(t1_) + x2*cos(t1_+t2_) + param_.t*cos(t1_+t2_+pi/2) == ...
+        x4 + 0 + x3*cos(t1_+t2_-pi/2);
+    EQ4 = param_.a*sin(t1_) + x2*sin(t1_+t2_) + param_.t*sin(t1_+t2_+pi/2) == ...
+        param_.O(2) + x3 + x3*sin(t1_+t2_-pi/2);
+    [A, B] = equationsToMatrix([EQ1, EQ2, EQ3, EQ4], [x1, x2, x3, x4]);
+    x(:, ii) = vpa(A\B); 
+end
+x = x';
+save('Results\ContactComparisons.mat', 'p1', 'p2', 'a', 'b', 't1', 't2', 'x')
+
+% load('Results\ContactComparisons.mat')
+e_p1 = mean((x(:, 1)-p1)./p1*100)
+e_p2 = mean((x(:, 2)-p2)./p2*100)
+tbl = table(t1, t2, p1, p2, x(:, 1), x(:, 2), x(:, 1)-p1, x(:, 2)-p2, ...
+    'VariableNames', {'t1', 't2', 'p1', 'p2', 'r1', 'r2', 'e1', 'e2'});
+
+
+p1_error_fit =fitlme(tbl, 'e1 ~ t1^3*t2^3');
+fig1 = figure(1);
+hold on
+scatter3(tbl.t1, tbl.t2, tbl.e1, 'ob')
+scatter3(tbl.t1, tbl.t2, predict(p1_error_fit, tbl), '.b')
+view([-45 22.5])
+
+p2_error_fit=fitlme(tbl, 'e2 ~ t1^3*t2^3');
+fig2 = figure(2);
+hold on
+scatter3(tbl.t1, tbl.t2, tbl.e2, 'or')
+scatter3(tbl.t1, tbl.t2, predict(p2_error_fit, tbl), '.r')
+view([-45 22.5])
+
+idx = find(abs(tbl.e1)+abs(tbl.e2) < 1E-4);
+tbl2 = table(tbl.t1(idx), tbl.t2(idx), 'VariableNames', {'t1', 't2'});
+lme3 = fitlme(tbl2, 't2 ~ t1^3')
+
+fig3 = figure(3);
+fig3.Position = [650 100 550 400];
+s1 = surf(reshape(rad2deg(t1), 101, 101), reshape(rad2deg(t2), 101, 101), ...
+    reshape((x(:, 1)-p1)./p1*100, 101, 101), 'FaceColor', 'b', 'EdgeColor', 'none', 'FaceAlpha', 0.5);
+hold on
+s2 = surf(reshape(rad2deg(t1), 101, 101), reshape(rad2deg(t2), 101, 101), ...
+    reshape((x(:, 2)-p2)./p2*100, 101, 101), 'FaceColor', 'r', 'EdgeColor', 'none', 'FaceAlpha', 0.5);
+t2_est = rad2deg(predict(lme3, table(unique(t1), 'VariableNames', {'t1'})));
+plot3(rad2deg(unique(t1)), t2_est, zeros(size(unique(t1))), 'k', 'LineWidth', 3)
+% material metal
+xl = xlabel('$\theta_1$ ($^\circ$)', 'Interpreter', 'latex', 'FontName', 'Times', 'FontSize', 18);
+xl.Position = [80 32 -59.1];
+yl = ylabel('$\theta_2$ ($^\circ$)', 'Interpreter', 'latex', 'FontName', 'Times', 'FontSize', 18);
+yl.Position = [32 80 -59.1];
+zl = zlabel('Error (\%)', 'Interpreter', 'latex', 'FontName', 'Times', 'FontSize', 18);
+title('Circular Contact Location Error', 'FontName', 'Times', 'FontSize', 18);
+lgd = legend('$p_1$', '$p_2$', '', 'interpreter', 'latex', 'FontName', 'Times', 'FontSize', 18, 'location', 'northwest');
+lgd.EdgeColor = 'none'; %lgd.Color = 'none'; 
+lgd.Position = [0.1348 0.6331 0.1321 0.1552];
+view([-45 22.5])
+
+exportgraphics(fig3, 'Circular vs Elliptical Contact Location Error.png', 'Resolution', 1000);
