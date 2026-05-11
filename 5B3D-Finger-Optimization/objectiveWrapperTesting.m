@@ -1,0 +1,344 @@
+clear;close all;clc;
+theta1_range = [deg2rad(50), deg2rad(100)]; % Entire Workspace (D = 50.8:152.4 mm)
+theta2_range = [deg2rad(50), deg2rad(100)]; % Entire Workspace
+theta3_range = [deg2rad(-70), deg2rad(40)]; % Every possible actuator angle
+% Finger discretized angle grid (rad):
+N_samples = 31;  % controls how many different finger configurations to test. 
+% Number of configurations = (N_samples+1)^2
+range3 = rad2deg(theta3_range(2))-rad2deg(theta3_range(1));
+d3 = 30; % precision of actuator angle in degrees^-1
+theta_1 = linspace(theta1_range(1), theta1_range(2), N_samples+1);  % affects number of objects
+theta_2 = linspace(theta2_range(1), theta2_range(2), N_samples+1);  % affects number of objects
+theta_3 = linspace(theta3_range(1), theta3_range(2), d3*range3+1);  % dense grid helps robustness
+
+%% Testing specific configurations
+% theta_1 = deg2rad(56);
+% theta_2 = deg2rad(56);
+
+% x = [0.04602; 0.11834; 1.8; 0.001];
+% x = [0.04602; 0.11834; 7.2; 0.001];
+x = [0.040; 0.122; 6.3; 0.005];
+
+val = objectiveWrapper(x, theta_1, theta_2, theta_3)
+%% Objective (Omega):
+% Computes the scalar objective Omega(x) for a given design x = [d;c;k1;k2].
+% The objective is the mean (over t1×t2 rows) of the mean Omega across t3,
+% evaluated only on *pointwise-feasible* cells.
+%
+% Memory efficiency:
+%   - Full cross-product over t1×t2 is formed once (size M1×M2).
+%   - t3 is streamed in blocks (size B) to avoid forming numel(th1)*numel(th2)×K arrays.
+%   - Per-row accumulators (sum/count) are maintained across blocks.
+% Notes:
+%   - Ensure units are consistent with your updateFinger implementation.
+%   - Keep w1,w2 consistent with your Archimedean weighting rationale.
+% To Do:
+%   - If a row has zero feasible cells, it is ignored in the mean (omitnan).
+%     - need to change this logic, since no feasibility is bad and should
+%     not be ignored
+function val = objectiveWrapper(x, th1, th2, th3)
+    tic
+    % Memory-light Ω(x) over FULL cross-product θ1×θ2, streaming θ3 in blocks.
+
+    % Design vars
+    d = x(1); c_r = x(2); k1 = x(3); k2 = x(4);
+
+    % Weights & limits
+    lambda = [0.25; 0.75]; % Weights of the contact direction priority. 
+    % The strength of an enveloping grasp heavily depends on the distal 
+    % finger link contact, since that link predominantly opposes the palm.
+    %% Constaint limits
+    tau_max = 5.0; % actuator effort limit
+    cmp_max = 20; % maximum amount of compression
+    Ny_max = 5; % maximum ejection force allowed
+    N1_max = 5; % allowable negative normal force for contact 1
+
+    % Cross-product sizes
+    th1 = th1(:); th2 = th2(:); th3 = th3(:);
+    if numel(th1)*numel(th2)==0 || numel(th3)==0, val = 1e12; return; end
+
+    % Stream θ3 in blocks to reduce the memory
+    B = 256;
+    dth3 = (th3(end)-th3(1))/numel(th3);
+    j=0;
+    contactLoc = NaN*zeros(numel(th1), numel(th2));
+    startLoc = contactLoc;
+    endLoc = startLoc;
+    check = zeros(numel(th1), numel(th2));
+    feasSpan = NaN*zeros(numel(th1), numel(th2), 3);
+    tol = 1e-1;
+    for kk = 1:B:numel(th3)
+        %% chunks of the actuator angle domain --> th3(kk:min(kk+B-1, numel(th3)))
+        [th1s, th2s, th3s] = meshgrid(th1, th2, th3(kk:min(kk+B-1, numel(th3))));
+        M = size(th1s); % will be used to reconstruct the meshsgrids
+        %% Call Model
+        [tau, N1, N2, cmp, Nx, Ny] = updateFinger(th1s, th2s, th3s, d, c_r, k1, k2);
+
+        %% Check Feasibility (Hard/Binary)
+        % Pointwise feasibility (block)
+        % g1 = tau <= tau_max;       % Limit the actuator effort
+        % g2 = tau > 0;              % Limit the sign of the effort
+        % g3 = N1 > -N1_max;                 % Contact forces must be positive
+        % g4 = N2 > 0;                 % Contact forces must be positive
+        % g5 = cmp > 0;                   % No extension of the spring
+        % g6 = cmp <= cmp_max;            % Limit the compression
+        % g7 = Ny > -Ny_max;                 % Ensures the palm is in contact
+        % pass_hard = g1 & g2 & g3 & g4 & g5 & g6 & g7; % 0 or 1
+
+        %% Check Feasibility (Some are soft and some are hard)
+        m = 120; % tunable "slope" of the constraints barriers
+        % Tune manually by playing with the following:---------------------
+        % A = -6:0.001:6; A = A(:);
+        % sTest = 1 ./ (1 + exp(-mForce .* (tau_max - abs(A))));  % ~0 if N1<0, ~1 if N1>0
+        % plot(A, sTest)
+        % -----------------------------------------------------------------
+        s1 = 1 ./ (1 + exp(-m .* (tau_max - tau)));  % ~0 if N1<0, ~1 if N1>0
+        s2 = 1 ./ (1 + exp(-2*m .* tau));  % ~0 if N1<0, ~1 if N1>0
+        s3 = 1 ./ (1 + exp(-m .* (N1 + N1_max)));  % ~0 if N1<0, ~1 if N1>0
+        s4 = 1 ./ (1 + exp(-m./2 .* N2));  % ~0 if N2<0, ~1 if N2>0
+        s5 = 1 ./ (1 + exp(-m .* (cmp_max - cmp)));  % ~0 if N2<0, ~1 if N2>0
+        s6 = 1 ./ (1 + exp(-m .* cmp));  % ~0 if N2<0, ~1 if cmp>0
+        s7 = 1 ./ (1 + exp(-m .* (Ny + Ny_max))); % ~0 if Ny<-5, ~1 if Ny>-5
+
+        pass_soft = (s1.*s2.*s3.*s4.*s5.*s6.*s7).^(1/2); % this is 
+        % multiplied by omega instead of also computing a seperate 
+        % nonlinear constraint function
+        % pass_soft = mean([s1, s2, s3, s4, s5, s6, s7], 2, 'omitnan').^7;
+
+        %% Constraint Visualization
+        % figure(3)
+        % hold on
+        % temp = reshape(s1, M);
+        % plot(squeeze(th3s(1, 1, :)), squeeze(temp(1, 1, :)), 'LineWidth', 1.5)
+        % temp = reshape(s2, M);
+        % plot(squeeze(th3s(1, 1, :)), squeeze(temp(1, 1, :)), 'LineWidth', 1.5)
+        % temp = reshape(s3, M);
+        % plot(squeeze(th3s(1, 1, :)), squeeze(temp(1, 1, :)), 'LineWidth', 1.5)
+        % temp = reshape(s4, M);
+        % plot(squeeze(th3s(1, 1, :)), squeeze(temp(1, 1, :)), 'LineWidth', 1.5)
+        % temp = reshape(s5, M);
+        % plot(squeeze(th3s(1, 1, :)), squeeze(temp(1, 1, :)), 'LineWidth', 1.5)
+        % temp = reshape(s6, M);
+        % plot(squeeze(th3s(1, 1, :)), squeeze(temp(1, 1, :)), 'LineWidth', 1.5)
+        % temp = reshape(s7, M);
+        % plot(squeeze(th3s(1, 1, :)), squeeze(temp(1, 1, :)), 'LineWidth', 1.5)
+        % temp = reshape(pass_soft, M);
+        % plot(squeeze(th3s(1, 1, :)), squeeze(temp(1, 1, :)), 'k', 'LineWidth', 2)
+        % legend('s1', 's2', 's3', 's4', 's5', 's6', 's7', 'pass', 'location', 'northwest')
+        % ylim([-0.1 1.1])
+        % figure
+        % hold on
+        % t = linspace(-pi/2, pi/2, 1001); t = t(:);
+        % h1 = heaviside(t+1) - heaviside(t+0.5) + heaviside(t-0.1) - heaviside(t-1.4);
+        % h2 = heaviside(t+1.25);
+        % plot(t, h1, 'b', 'LineWidth', 2)
+        % plot(t, h2, 'r', 'LineWidth', 2)
+        % ylabel('Condition', 'Fontsize', 12)
+        % xlabel('$\theta_3$', 'Interpreter', 'latex', 'Fontsize', 12)
+        % axis([-1.5 1.5 -0.1 1.1])
+        % legend('$h_1$', '$g_5$', 'Interpreter', 'latex', ...
+        %     'location', 'southeast', 'Fontsize', 12)
+
+
+        %% Domain-wide h1 and h2 constraints
+        % h1: The first feasible continuous span (in th3) must start within delta_1 of
+        % the first contact at every finger configuraiton (sweeping over
+        % th3 only). In other words, the actuator cannot increase its angle
+        % to go from unfeasible to feasible after contact with an object is
+        % made. This constraint affects the negative volumes in the
+        % feasibility space caused by instability from the ICR changing.
+        %
+        % h2: The first feasible continuous span (in th3) must be larger
+        % than delta_2. This contraint will tune the main compression spring
+        % to change the grasp force observability.
+        %    
+        % We need to measure where s6 becomes positive and where the overall
+        % feasibility of the finger configuration starts and ends when
+        % sweeping over all possible actuator angles
+
+        % M = size(span_toggle);
+        cmp = reshape(cmp, M); % find where cmp first becomes > 0
+        pass_soft = reshape(pass_soft, M);
+        
+        s6Local = reshape(s6, M);
+        for ii = 1:M(1)
+            for jj = 1:M(2)
+                if check(ii, jj) == 0
+                    temp = s6Local(ii, jj, :); temp = temp(:);
+                    % first actuator angle that causes spring compression
+                    p = find(temp > tol, 1, 'first');
+                    if ~isempty(p) & isnan(feasSpan(ii, jj, 1))
+                        feasSpan(ii, jj, 1) = kk-1+p;
+                    end
+                    temp = pass_soft(ii, jj, :); temp = temp(:);
+                    % first overall feasible actuator angle
+                    n = find(temp > tol);
+                    % Check to see if there is very temporary infeasibility
+                    try
+                        if n(1) == 2 % add the first element if missing
+                                pass_soft(ii, jj, 1) = pass_soft(ii, jj, 2);
+                                temp = pass_soft(ii, jj, :); temp = temp(:);
+                                n = find(temp > tol);
+                        end
+                        if any(diff(n)>1)
+                            for p = 2:numel(n)
+                                tmp = n(p) - n(p-1);
+                                if tmp > 1 && tmp <= floor(deg2rad(1)/dth3)
+                                    % if there is a small infeasibility
+                                    % section in pass, overwrite the small section
+                                    pass_soft(ii, jj, n(p-1):n(p)) = pass_soft(ii, jj, n(p-1));
+                                    n = [(n(1):n(p)-1)'; n(p:end)]; 
+                                end
+                            end
+                        end
+                    end
+                    if isempty(n)
+                        pass_soft(ii, jj, :) = 0;
+                    else
+                        try
+                            pass_soft(ii, jj, 1:n(1)-1) = 0;
+                            if isnan(feasSpan(ii, jj, 2))
+                                feasSpan(ii, jj, 2) = kk-1+n(1);
+                            end
+                        catch
+                            fprintf('uh oh (n=1)\n');
+                        end
+                        % last overall feasible actuator angle
+                        o = find(temp(n(1):end) < tol) + n(1)-1;
+                        if ~isempty(o)
+                            pass_soft(ii, jj, o(1):end) = 0;
+                            if isnan(feasSpan(ii, jj, 3))
+                                feasSpan(ii, jj, 3) = kk+o(1)-1;
+                            end
+                            check(ii, jj) = 1;
+                        end % else do nothing
+                    end
+                else
+                    pass_soft(ii, jj, :) = 0;
+                end
+            end
+        end
+        
+
+        %% Assemble Omega
+        Omega1 = abs(lambda(1).*Nx./tau); % Force per actuator effort
+        Omega2 = abs(lambda(2).*Ny./tau); 
+        Omega_kk = (Omega1 + Omega2); % total mechanical advantage (without constraints)
+        % limit large numbers
+        Omega_kk(Omega_kk > 1/tol) = 1/tol;
+
+        j = j+1;
+        %% Accumulate Omega
+        if j==1
+            pass = pass_soft(:);
+            Omega = Omega_kk;
+        else
+            pass = vertcat(pass, pass_soft(:));
+            Omega = vertcat(Omega, Omega_kk);
+        end
+
+        %% how to reshape vectors back to meshgrids for inspection if needed
+        % tau = reshape(tau, M);
+    end
+    %% Finalize the mechanical advantage objective function
+    % max allowable gap between contact and feasible in rads
+    gap_max = deg2rad(1); 
+    % want 3 degrees. minimum allowable continuous span of feasibility in rads (divide be 2)
+    span_min = deg2rad(1.5); 
+    % convert to indices
+    gap_max = floor(gap_max./((th3(end)-th3(1))./numel(th3)));
+    span_min = ceil(span_min./((th3(end)-th3(1))./numel(th3)));
+    % if no start of feasibility is detected, replace nans with minimum th3
+    temp = feasSpan(:, :, 2);
+    temp(isnan(feasSpan(:, :, 2))) = 1;
+    feasSpan(:, :, 2) = temp;
+    % if no end of feasibility is detected, replace nans with maximum th3
+    temp = feasSpan(:, :, 3);
+    temp(isnan(feasSpan(:, :, 3))) = numel(th3); 
+    feasSpan(:, :, 3) = temp;
+    % make these domain-wide contraints soft
+    m = 1;
+    sd1 = feasSpan(:, :, 2) - feasSpan(:, :, 1);
+    sd1 = 1 ./ (1 + exp(-m .* (gap_max - sd1)));
+    sd2 = feasSpan(:, :, 3) - feasSpan(:, :, 2);
+    sd2 = 1 ./ (1 + exp(-m/5 .* (sd2 - span_min)));
+
+    % Reshape the pass and finalize objective function
+    pass = reshape(pass, numel(th1), numel(th2), []);
+    pass = pass.*(sd1.*sd2); 
+    Omega = reshape(Omega, numel(th1), numel(th2), []);
+    Omega = Omega.*pass; % ----- apply the constraints -----
+    % add limits to Omega for finite inverting later
+    Omega(Omega < tol) = tol; Omega(Omega > 1/tol) = 1/tol; 
+    toc
+
+    %% Plots
+    [th1s, th2s, th3s] = meshgrid(th1, th2, th3);
+    fig1 = figure(1); % Format Plot
+    fig1.Position = [1300 500 900 600];
+    hold on
+    pass_plot = pass; pass_plot(pass < tol) = NaN;
+    scatter3(th1s(:), th2s(:), th3s(:), 20*ones(size(th1s(:))), pass_plot(:), 'filled')
+    xlabel('$\theta_1$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    ylabel('$\theta_2$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    zlabel('$\theta_3$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    % title('Soft Feasibility Plot', 'FontSize', 12)
+    c = colorbar; c.Label.String = 'Feasibility Fraction'; c.FontSize = 12;
+    clim([0 1]);
+    colormap copper
+    view(-35, 35)
+    ax1 = gca;
+    hold off
+    fig2 = figure(2); % Format Plot
+    fig2.Position = [1400 400 900 600];
+    hold on
+    Omega_plot = Omega; Omega_plot(pass <= tol) = NaN;
+    scatter3(th1s(:), th2s(:), th3s(:), 20*ones(size(th1s(:))), Omega_plot(:), 'filled')
+    xlabel('$\theta_1$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    ylabel('$\theta_2$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    zlabel('$\theta_3$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    % title('Mechanical Advantage Plot (N/Nm)', 'FontSize', 12)
+    c = colorbar; c.Label.String = 'N/Nm'; c.FontSize = 12;  
+    clim([0 10]);
+    colormap copper
+    view(-35, 35)
+    ax2 = gca;
+    hold off
+    
+    %% Average the mechanical advantage over all configurations -> make into scalar
+    % find the percentage of feasible actuator angles
+    Psi = mean(Omega > tol, 3, 'omitnan');
+    sumOmega = sum(Omega, 3, 'omitnan');
+    % Sum the mechanical advantage over actuator angles and
+    % normalize by the fraction of feasible actuator angles. This
+    % will punish finger confiugurations with good mechanical
+    % advantage with low force observability.
+    objOmega = sumOmega.*Psi;
+    val = mean(objOmega, 'all', 'omitnan');
+    %% invert for minimization approach -> actautor effort per contact force (Nm/N)
+    val = 1./val;
+end
+
+
+%% Finger Model (called from objective function):
+function [tau, N1, N2, cmp, Nx, Ny] = updateFinger(th1, th2, th3, d, c_r, k1, k2)
+    th1 = th1(:); th2 = th2(:); th3 =th3(:); % enforce column vectors
+    % Project-specific function calls (presumed available in your codebase)
+    N = numel(th1);
+    if ~(numel(th2)==N && numel(th3)==N), error('updateFinger: angle vectors must be meshgrids'); end
+    optFlag = true; % set optimization flag to true
+    param = getParam(optFlag, d, c_r, k2); % Not vector safe
+    param = updateParam(param, th1, th2, th3); % Vector safe
+    Jac   = getJacobians(param, th1, th2, th3); % Vector safe
+    [cmp, F_cmp, tau, ~] = getSpring(param, th1, th2, th3, k1, true); % Vector safe (cmp in mm, F_cmp in N, TA in Nm, k1 in N/mm)
+    [N1, N2] = fastSolveN1N2(Jac.J1, Jac.J2, Jac.JC, ... % numerically solve the system of equations
+                                  param.n1, param.n2, param.nC, ...
+                                  F_cmp, param.K2, th2, param.l2_r, false);
+    tau = tau(:); N1 = N1(:); N2 = N2(:); cmp = cmp(:); % output vectors as columns
+
+    % Report cartesian forces produced by the finger
+    Nx = N1.*param.n1(1, :)' + N2.*param.n2(1, :)';
+    Ny = N1.*param.n1(2, :)' + N2.*param.n2(2, :)';
+
+    Nx = Nx(:); Ny = Ny(:);
+end

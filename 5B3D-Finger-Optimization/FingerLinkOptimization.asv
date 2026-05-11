@@ -1,0 +1,85 @@
+%% 5B3D-Finger-Model: Main Optimization
+%% Author: Alexander B. Ambrose
+%% Date: 8-6-2025
+
+%% Description:
+% This script solves the 5-Bar-3-DOF finger static model for contact 
+% force estimation as functions of the optimization parameters (d) and (c_R). 
+% A parallel pool of 8 workers can solve this model in
+% about 2-minutes. The output contact force (N) has two columns, the first
+% column is the contact force produced by the proximal and the second 
+% column is for the distal phalange.
+
+%% Main 
+clear all; close all; clc;
+warning('off', 'all');
+% d = 0.046; c = .118; k1 = 7.2; k2 = 0.02; % [=] Nm/rad
+
+% must support paired vectors of vairable paramters
+th1 = linspace(deg2rad(45), deg2rad(90), 6)'; th2 = th1; 
+th3 = linspace(-deg2rad(45), deg2rad(40), 6)'; 
+d = linspace(0.03, 0.06, 6)'; c = linspace(0.075, 0.120, 6)';
+k1 = linspace(5, 10, 6)'; k2 = linspace(0.01, 0.06, 6)';
+
+% Load fixed finger paramters
+optFlag = true; % true: treats various functionalites as symbolic operations
+param = getParam(optFlag, d, c, k2);
+
+%% Sweep from hardstop to hardstop of finger states (from CAD)
+% Sweep over t_1 every 5 degrees
+% t_1 = linspace(deg2rad(45), deg2rad(105), 16)'; 
+% Sweep over t_2 every 5 degrees
+% t_2 = linspace(deg2rad(20), deg2rad(105), 16)'; 
+% Sweep the actuator angle over its entire range every 1 degrees
+% t_3 = linspace(deg2rad(-90), deg2rad(40), (90+40)+1)';
+% syms t_1 t_2 t_3
+% assume(t_1>0 & t_1<2*pi) % angles between 0 and 2Pi
+% assume(t_2>0 & t_2<2*pi)
+% assume(t_3>0 & t_3<2*pi)
+
+th1 = linspace(deg2rad(45), deg2rad(90), 6)'; th2 = th1; 
+th3 = linspace(-deg2rad(45), deg2rad(40), 6)';
+
+% Symbolic contact force magnitudes
+syms N1 N2
+assume(N1, {'real', 'positive'});
+assume(N2, {'real', 'positive'});
+% update parameters for this configuration
+%% assumes the th1, th2, th3, k1, and k2 are already pairs of vectors with the same length
+param = updateParam(param, th1, th2, th3); 
+% compute kinematics
+% if angles are vectors -> [:, :, N] where N is the length of the angle vectors 
+Jac = getJacobians(param, th1, th2, th3);
+% compute spring deflection & force
+[cmp, F_cmp, TA, flag] = getSpring(param, th1, th2, th3, k1, true);
+% build torque balance
+if numel(th1) == 1 && numel(th1) == numel(th2) && numel(th1) == numel(th3)
+    Tau_contacts = Jac.J1'*param.n1*N1 + Jac.J2'*param.n2*N2;
+    Tau_h = [0; param.K2*(th2 - param.l2_r)];
+    Tau_C = Jac.JC'*param.nC*F_cmp;
+    EQ = Tau_contacts + Tau_h + Tau_C == 0;
+elseif numel(th1) >1 && numel(th1) == numel(th2) && numel(th1) == numel(th3)
+    for ii = 1:numel(th1)
+        Tau_contacts = Jac.J1(:, '*param.n1*N1 + Jac.J2'*param.n2*N2;
+        Tau_h = [0; param.K2*(th2 - param.l2_r)];
+        Tau_C = Jac.JC'*param.nC*F_cmp;
+        EQ = Tau_contacts + Tau_h + Tau_C == 0;
+    end
+else %Bad
+    fprintf('@getJacobians: input vectors (t1 and t2) do not have the same length.\n')
+    while true == true %% Hang here
+        pause(1);
+    end
+end
+
+digits(80);
+S = vpasolve([EQ(1), EQ(2)], [N1, N2]);
+% N1 = matlabFunction(S.N1);
+% N2 = matlabFunction(S.N2);
+S.N1 = N1; S.N2 = N2;
+% cmp = matlabFunction(cmp);
+% TA = matlabFunction(TA);
+
+
+save('Results/OptimizationFunctions.mat', 'S', 'TA', 'cmp');
+

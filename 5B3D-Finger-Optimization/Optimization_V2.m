@@ -1,0 +1,512 @@
+%% 5B3D-Finger-Optimization: Main (MultiStart + fmincon)
+%% Author: Alexander B. Ambrose
+%% Date: 10-14-2025
+
+%% Description:
+% This script performs design optimization for the ANTERO Gripper finger 
+% model using MultiStart + fmincon. The objective Omega(x) is evaluated 
+% over a cross-product of theta1×theta2 and streamed across θ3 in blocks to keep 
+% memory usage low. Feasibility is enforced via an integrated nonlinear 
+% constraint function. Results are saved to disk.
+%
+% Key features:
+%   - Global search: Latin Hypercube starts (CustomStartPointSet) with parallel execution
+%   - Memory-light evaluation: theta3 is processed in blocks (size B) to avoid M×K arrays
+%   - Thread-based parallel pool recommended to share memory across workers
+%   - Reproducible runs via rng(42,'twister')
+
+%% This script defines/uses the following:
+%   Global angle grids (monotonic):
+%     theta_1 : theta1 samples (rad), length M1
+%     theta_2 : theta2 samples (rad), length M2
+%     theta_3 : theta3 samples (rad), length K
+%     (Full cross-product over theta1×theta2; theta3 is streamed in blocks.)
+%
+%   Design variable bounds (column vectors):
+%     lb = [d; c; k1; k2] lower bounds
+%     ub = [d; c; k1; k2] upper bounds
+%     x0 = starting guess within [lb,ub]
+%
+%   Optimization problem:
+%     objective : @objectiveWrapper (integrated penalties; averages Omega over feasible cells)
+%     options   : fmincon interior-point, L-BFGS Hessian approx, tight tolerances
+%     multistart: MultiStart('UseParallel',true,'StartPointsToRun','bounds-ineqs')
+%
+% Outputs:
+%   x_best, f_best, exitflag, out  : best design, objective value, and run info
+%   results_multistart.mat         : saves best solution and metadata
+
+%% Assumptions & units:
+%   - theta1, theta2, theta3 are in radians and monotonic.
+%   - tau is actuator torque in N·m, cmp is spring compression (mm).
+%   - k1 is in N/mm, k2 in N·m/rad;
+%   - updateFinger(th1,th2,th3,d,c,k1,k2) is vector-safe and returns column vectors.
+
+%% Dependencies:
+%   - updateFinger.m        : model evaluation (vector-safe over angle vectors)
+%   - objectiveWrapper.m    : scalar objective Omega(x) (streams theta3 blocks)
+
+%% Configuration knobs:
+%   - N_samples     : grid density for θ1, θ2 (θ3 often denser)
+%   - Block size B  : θ3 streaming block length (128–512 typical)
+%   - nStarts       : number of MultiStart initial points
+%   - Pool type     : parpool('threads') recommended for shared memory
+%   - rng seed      : rng(42,'twister') for reproducibility
+
+%% How to modify safely:
+%   - Change angle ranges or densities before optimization starts.
+%   - If memory is tight, reduce M1, M2, K and/or block size B.
+%   - To speed early iterations, use coarser grids; verify the final x_best
+%      on dense grids. Use less starts in the multistart (>=16 reommended).
+
+clear; close all; clc;
+rng(42,'twister');  % reproducible if needed
+%% --- Run this once if the wrong pool is opening
+% % Close any existing pool
+% p = gcp('nocreate'); if ~isempty(p), delete(p); end
+% % Try custom par pool
+% c = parcluster('local');
+% c.NumWorkers = 20;
+% saveProfile(c);
+% parpool(c, 20);
+% %% ---
+% pctRunOnAll maxNumCompThreads(1) ;
+
+%% Standard threads pool with shared memory (if memory is too much for PC)
+% parpool("threads")
+
+
+%% Declare global variables
+% Angle domains (radians)
+theta1_range = [deg2rad(45), deg2rad(100)]; % Entire Workspace (D = 50:180 mm)
+theta2_range = [deg2rad(45), deg2rad(100)]; % Entire Workspace
+theta3_range = [deg2rad(-70), deg2rad(40)]; % Every possible actuator angle
+% Finger discretized angle grid (rad):
+N_samples = 10;
+range3 = rad2deg(theta3_range(2))-rad2deg(theta3_range(1));
+d3 = 10; % precision of actuator angle in degrees^-1 (0.1)
+theta_1 = linspace(theta1_range(1), theta1_range(2), N_samples);  % affects number of objects
+theta_2 = linspace(theta2_range(1), theta2_range(2), N_samples);  % affects number of objects
+theta_3 = linspace(theta3_range(1), theta3_range(2), d3*range3);  % dense grid helps robustness
+%% Use parallel.pool.Constant for big angle grids (sent once per worker)
+th1par = parallel.pool.Constant(theta_1(:));
+th2par = parallel.pool.Constant(theta_2(:));
+th3par = parallel.pool.Constant(theta_3(:));
+
+% Design variable bounds: x = [d; c; k1; k2]
+lb = [0.040; 0.100; 1; 1e-4];        % [m; m; N/mm; Nm/rad]
+ub = [0.060; 0.122; 10; 1e-1];       % [m; m; N/mm; Nm/rad]
+x0 = [0.046; 0.118; 7.2; 0.001];      % initial guess
+
+%% set fmincon options to run quicker than normal
+opts = optimoptions('fmincon', ...
+  'Algorithm', 'sqp', ...
+  'HessianApproximation','lbfgs', ...
+  'Display','off', ...
+  'MaxIterations', 500, ...
+  'MaxFunctionEvaluations', 1e3, ...
+  'StepTolerance', 1e-6, ...         % was 1e-10
+  'OptimalityTolerance', 1e-4, ...    % was 1e-8
+  'FiniteDifferenceType','central', ...
+  'FiniteDifferenceStepSize', 1e-6, ...
+  'ScaleProblem', true, ...
+  'TypicalX',(lb+ub)/2);
+
+% opts = optimoptions('fmincon', ...
+%   'Algorithm', 'interior-point', ...
+%   'HessianApproximation','lbfgs', ...
+%   'Display','off', ...
+%   'MaxIterations', 500, ...
+%   'MaxFunctionEvaluations', 1e3, ...
+%   'StepTolerance', 1e-6, ...         % was 1e-10
+%   'OptimalityTolerance', 1e-4, ...    % was 1e-8
+%   'FiniteDifferenceType','central', ...
+%   'FiniteDifferenceStepSize', 1e-6, ...
+%   'ScaleProblem', true, ...
+%   'TypicalX',(lb+ub)/2);
+
+objHandle = @(x) objectiveWrapper_const(x, th1par, th2par, th3par);
+% conHandle = @(x) nonlconWrapper_const(x, th1par, th2par, th3par); %
+% wrapped this into the objective function already
+
+%% 1) Build the search problem with these handles using multistart
+problem = createOptimProblem('fmincon', ...
+    'objective', objHandle, ...
+    'x0', x0, 'lb', lb, 'ub', ub, ...
+    'options', opts);
+    % 'nonlcon', conHandle, ... % nonlcon is inside objHandle now
+    
+
+%% MultiStart config
+ms = MultiStart('UseParallel', true, ...
+                'StartPointsToRun','all', ...   % <— was 'bounds-ineqs'
+                'Display','iter');
+
+% Latin Hypercube initial points (good coverage for nonconvex Omega)
+nStarts = 20; % 100 seems to be a good balance between speed and effective searching
+Xlhs = lhsdesign(nStarts, numel(lb));          % nStarts x 4
+X0   = lb(:)'+ Xlhs.*(ub(:)'-lb(:)');          % nStarts x 4, rows = start points
+% Wrap all starts in one object and pass to MultiStart
+custpts = CustomStartPointSet(X0);
+
+% Run
+ticVal = tic;
+% [x_best, f_best, exitflag, out, sols] = run(ms, problem, {custpts, randpts}); % with extras
+[x_best, f_best, exitflag, out, sols] = run(ms, problem, custpts); % faster
+% [x_best, f_best, exitflag, out] = run(ms, problem, custpts); % even faster
+elapsed = toc(ticVal);
+
+nRuns = numel(sols);
+if nRuns == 0
+    warning('MultiStart ran 0 local solvers. Trying a single fmincon from x0.');
+    [x_best, f_best, exitflag, out] = fmincon(problem);   % no solutions here
+    fprintf('\n=== Best solution (single run) ===\n');
+    disp(x_best)
+    fprintf('Ω(x*) = %.6g\n', f_best);
+else
+    succ  = nnz([sols.Exitflag] > 0);
+    fvals = [sols.Fval];
+    bestF = min(fvals);
+    bestI = find(fvals == bestF, 1);
+    bestX = sols(bestI).X; %#ok<NASGU>
+
+    fprintf('\n=== Best solution ===\n');
+    disp(x_best)
+    fprintf('Ω(x*) = %.6g (bestF from sols = %.6g)\n', f_best, bestF);
+    fprintf('Exitflag: %d  |  Successes: %d/%d\n', exitflag, succ, nRuns);
+end
+
+% % 2) Refinement on a denser grid (e.g., 32x32x2200)
+d3 = 30; % 0.05 degree precision
+th1_ref = linspace(theta1_range(1), theta1_range(2), 2*N_samples);  % affects number of objects
+th2_ref = linspace(theta2_range(1), theta2_range(2), 2*N_samples);  % affects number of objects
+th3_ref = linspace(theta3_range(1), theta3_range(2), d3*range3);  % dense grid helps robustness
+
+th1C_ref = parallel.pool.Constant(th1_ref(:));
+th2C_ref = parallel.pool.Constant(th2_ref(:));
+th3C_ref = parallel.pool.Constant(th3_ref(:));
+
+objRef  = @(x) objectiveWrapper_const(x, th1C_ref, th2C_ref, th3C_ref);
+% conRef  = @(x) nonlconWrapper_const(x, th1C_ref, th2C_ref, th3C_ref);
+
+optsRef = optimoptions('fmincon', ...
+    'Algorithm','sqp', 'HessianApproximation','lbfgs', 'UseParallel',true, ...
+    'MaxIterations', 2e3, 'MaxFunctionEvaluations', 2e4, ...
+    'StepTolerance',1e-9, 'FunctionTolerance',1e-8, 'OptimalityTolerance',1e-6, ...
+    'FiniteDifferenceType','central','FiniteDifferenceStepSize',1e-6, ...
+    'ScaleProblem',true, 'TypicalX',(lb+ub)/2, 'Display','iter-detailed');
+
+% [x_ref, f_ref, exitflag_ref, out_ref] = fmincon(objRef, x_best, [],[],[],[], lb, ub, conRef, optsRef);
+[x_ref, f_ref, exitflag_ref, out_ref] = fmincon(objRef, x_best, [],[],[],[], lb, ub, [], optsRef);
+fprintf('\nRefined: Omega=%.6g, exitflag=%d, iters=%d, fcount=%d\n', ...
+        f_ref, exitflag_ref, out_ref.iterations, out_ref.funcCount);
+
+% 3) Final verification on the target dense grid (e.g., 64x64x4400)
+d3 = 40; % 0.025 degree precision
+th1_final = linspace(theta1_range(1), theta1_range(2), 4*N_samples);  % affects number of objects
+th2_final = linspace(theta2_range(1), theta2_range(2), 4*N_samples);  % affects number of objects
+th3_final = linspace(theta3_range(1), theta3_range(2), d3*range3);  % dense grid helps robustness
+
+th1C_final = parallel.pool.Constant(th1_final(:));
+th2C_final = parallel.pool.Constant(th2_final(:));
+th3C_final = parallel.pool.Constant(th3_final(:));
+
+objFinal = @(x) objectiveWrapper_const(x, th1C_final, th2C_final, th3C_final);
+% conFinal = @(x) nonlconWrapper_const(x, th1C_final, th2C_final, th3C_final);
+
+f_final = objFinal(x_ref);
+% [c_final,~] = conFinal(x_ref);
+% fprintf('Final check: Omega=%.6g, max(c)=%.6g (≤0 means domain-wide OK)\n', f_final, max(c_final));
+fprintf('Final check: Omega=%.6g\n', f_final);
+%% Save Results
+run_tag = datestr(now,'yyyymmdd_HHMMSS');
+fname = sprintf('Results/Opt_V2_Output__%s.mat', run_tag);
+
+% Only save variables that actually exist (guards if you stop early)
+safeSave = @(v) evalin('base', sprintf('exist(''%s'',''var'')==1', v));
+
+vars = { ...
+ 'theta1_range','theta2_range','theta3_range', 'w1', 'w2',...
+ 'N_samples','range3','d3', ...
+ 'theta_1','theta_2','theta_3', ...
+ 'lb','ub','x0','opts','nStarts','X0', ...
+ 'x_best','f_best','exitflag','out','sols','elapsed', ...
+ 'th1_ref','th2_ref','th3_ref','x_ref','f_ref','exitflag_ref','out_ref', ...
+ 'th1_final','th2_final','th3_final','f_final','c_final'};
+
+keep = vars(cellfun(safeSave, vars));
+
+if isempty(keep)
+    warning('Nothing to save yet. Run the optimization first.');
+else
+    save(fname, keep{:}, '-v7.3');
+    fprintf('Saved %d variables to %s\n', numel(keep), fname);
+end
+
+%% Finger Model (called from objective function):
+function [tau, N1, N2, cmp, Nx, Ny] = updateFinger(th1, th2, th3, d, c_r, k1, k2)
+    th1 = th1(:); th2 = th2(:); th3 =th3(:); % enforce column vectors
+    % Project-specific function calls (presumed available in your codebase)
+    N = numel(th1);
+    if ~(numel(th2)==N && numel(th3)==N), error('updateFinger: angle vectors must be meshgrids'); end
+    optFlag = true; % set optimization flag to true
+    param = getParam(optFlag, d, c_r, k2); % Not vector safe
+    param = updateParam(param, th1, th2, th3); % Vector safe
+    Jac   = getJacobians(param, th1, th2, th3); % Vector safe
+    [cmp, F_cmp, tau, ~] = getSpring(param, th1, th2, th3, k1, true); % Vector safe (cmp in mm, F_cmp in N, TA in Nm, k1 in N/mm)
+    [N1, N2] = fastSolveN1N2(Jac.J1, Jac.J2, Jac.JC, ... % numerically solve the system of equations
+                                  param.n1, param.n2, param.nC, ...
+                                  F_cmp, param.K2, th2, param.l2_r, false);
+    tau = tau(:); N1 = N1(:); N2 = N2(:); cmp = cmp(:); % output vectors as columns
+
+    % Report cartesian forces produced by the finger
+    Nx = N1.*param.n1(1, :)' + N2.*param.n2(1, :)';
+    Ny = N1.*param.n1(2, :)' + N2.*param.n2(2, :)';
+
+    Nx = Nx(:); Ny = Ny(:);
+end
+
+% Wrappers (called on par workers if used):
+function val = objectiveWrapper_const(x, th1C, th2C, th3C)
+    val = objectiveWrapper(x, th1C.Value, th2C.Value, th3C.Value);
+end
+
+%% Objective (Omega):
+% Computes the scalar objective Omega(x) for a given design x = [d;c;k1;k2].
+% The objective is the mean (over t1×t2 rows) of the mean Omega across t3,
+% evaluated only on *pointwise-feasible* cells.
+%
+% Memory efficiency:
+%   - Full cross-product over t1×t2 is formed once (size M1×M2).
+%   - t3 is streamed in blocks (size B) to avoid forming numel(th1)*numel(th2)×K arrays.
+%   - Per-row accumulators (sum/count) are maintained across blocks.
+% Notes:
+%   - Ensure units are consistent with your updateFinger implementation.
+%   - Keep w1,w2 consistent with your Archimedean weighting rationale.
+% To Do:
+%   - If a row has zero feasible cells, it is ignored in the mean (omitnan).
+%     - need to change this logic, since no feasibility is bad and should
+%     not be ignored
+function val = objectiveWrapper(x, th1, th2, th3)
+    % Memory-light Ω(x) over FULL cross-product θ1×θ2, streaming θ3 in blocks.
+    % Design vars
+    d = x(1); c_r = x(2); k1 = x(3); k2 = x(4);
+    % Weights & limits
+    % lambda = [0.25; 0.75]; % Weights of the contact direction priority. 
+    lambda = [1/3; 2/3];
+    % The strength of an enveloping grasp heavily depends on the distal 
+    % finger link contact, since that link predominantly opposes the palm.
+    %% Constaint limits
+    tau_max = 5.0; % actuator effort limit
+    cmp_max = 20; % maximum amount of compression
+    Ny_max = 5; % maximum ejection force allowed
+    % Cross-product sizes
+    th1 = th1(:); th2 = th2(:); th3 = th3(:);
+    if numel(th1)*numel(th2)==0 || numel(th3)==0, val = 1e12; return; end
+    % Stream θ3 in blocks to reduce the memory
+    B = 256;
+    j=0;
+    % init matrices
+    check = zeros(numel(th1), numel(th2));
+    feasSpan = NaN*zeros(numel(th1), numel(th2), 3);
+    for kk = 1:B:numel(th3)
+        %% chunks of the actuator angle domain --> th3(kk:min(kk+B-1, numel(th3)))
+        [th1s, th2s, th3s] = meshgrid(th1, th2, th3(kk:min(kk+B-1, numel(th3))));
+        M = size(th1s); % will be used to reconstruct the meshsgrids
+        %% Call Model
+        [tau, N1, N2, cmp, Nx, Ny] = updateFinger(th1s, th2s, th3s, d, c_r, k1, k2);
+
+        %% Point-Wise Constraints
+        %% Check Feasibility (Hard/Binary)
+        % Pointwise feasibility (block)
+        % g1 = tau <= tau_max;       % Limit the actuator effort
+        % g2 = tau > 0;              % Limit the sign of the effort
+        % g3 = N1 > 0;                 % Contact forces must be positive
+        % g4 = N2 > 0;                 % Contact forces must be positive
+        % g5 = cmp > 0;                   % No extension of the spring
+        % g6 = cmp <= cmp_max;            % Limit the compression
+        % g7 = Ny > -Ny_max;                 % Ensures the palm is in contact
+        % pass_hard = g1 & g2 & g3 & g4 & g5 & g6 & g7; % 0 or 1
+
+        %% Check Feasibility (Soft)
+        m = 40; % tunable "slope" of the constraints barriers
+        % Tune manually by playing with the following:---------------------
+        % A = -6:0.001:6; A = A(:);
+        % sTest = 1 ./ (1 + exp(-mForce .* (tau_max - abs(A))));  % ~0 if N1<0, ~1 if N1>0
+        % plot(A, sTest)
+        % -----------------------------------------------------------------
+        s1 = 1 ./ (1 + exp(-m .* (tau_max - abs(tau))));  % ~0 if N1<0, ~1 if N1>0
+        s2 = 1 ./ (1 + exp(-2*m .* tau));  % ~0 if N1<0, ~1 if N1>0
+        s3 = 1 ./ (1 + exp(-m .* N1));  % ~0 if N1<0, ~1 if N1>0
+        s4 = 1 ./ (1 + exp(-m./2 .* N2));  % ~0 if N2<0, ~1 if N2>0
+        s5 = 1 ./ (1 + exp(-m .* (cmp_max - cmp)));  % ~0 if N2<0, ~1 if N2>0
+        s6 = 1 ./ (1 + exp(-m .* cmp));  % ~0 if N2<0, ~1 if cmp>0
+        s7 = 1 ./ (1 + exp(-m .* (Ny + Ny_max))); % ~0 if Ny<-5, ~1 if Ny>-5
+
+        pass_soft = s1.*s2.*s3.*s4.*s5.*s6.*s7; % this should be multiplied by omega
+
+        %% Specific Configuration Constraint Visualization
+        % figure(3)
+        % hold on
+        % plot(th3s(:), s1, 'k', 'LineWidth', 1.5)
+        % plot(th3s(:), s2, 'b', 'LineWidth', 1.5)
+        % plot(th3s(:), s3, 'r', 'LineWidth', 1.5)
+        % plot(th3s(:), s4, 'g', 'LineWidth', 1.5)
+        % plot(th3s(:), s5, 'k', 'LineWidth', 1.5)
+        % plot(th3s(:), s6, 'k', 'LineWidth', 1.5)
+        % plot(th3s(:), s7, 'm', 'LineWidth', 1.5)
+        % plot(th3s(:), pass_soft, 'k', 'LineWidth', 1.5)
+        % legend('s1', 's2', 's3', 's4', 's5', 's6', 's7', 'pass', 'location', 'northwest')
+
+        %% Domain-wide h1 and h2 constraints
+        % h1: The first feasible continuous span (in th3) must start within delta_1 of
+        % the first contact at every finger configuraiton (sweeping over
+        % th3 only). In other words, the actuator cannot increase its angle
+        % to go from unfeasible to feasible after contact with an object is
+        % made. This constraint affects the negative volumes in the
+        % feasibility space caused by instability from the ICR changing.
+        %
+        % h2: The first feasible continuous span (in th3) must be larger
+        % than delta_2. This contraint will tune the main compression spring
+        % to change the grasp force observability.
+        %    
+        % We need to measure where s6 becomes positive and where the overall
+        % feasibility of the finger configuration starts and ends when
+        % sweeping over all possible actuator angles
+
+        % M = size(span_toggle);
+        cmp = reshape(cmp, M); % find where cmp first becomes > 0
+        pass_soft = reshape(pass_soft, M); %pass_soft(pass_soft<1e-6) = 0;
+        
+        s6Local = reshape(s6, M);
+        for ii = 1:M(1)
+            for jj = 1:M(2)
+                if check(ii, jj) == 0
+                    temp = s6Local(ii, jj, :); temp = temp(:);
+                    % first actuator angle that causes spring compression
+                    p = find(temp > 1e-9, 1, 'first');
+                    if ~isempty(p) & isnan(feasSpan(ii, jj, 1))
+                        feasSpan(ii, jj, 1) = kk-1+p;
+                    end
+                    temp = pass_soft(ii, jj, :); temp = temp(:);
+                    % first overall feasible actuator angle
+                    n = find(temp > 1e-9, 1, 'first');
+                    if isempty(n)
+                        pass_soft(ii, jj, :) = 0;
+                    else
+                        try
+                            pass_soft(ii, jj, 1:n-1) = 0;
+                            if isnan(feasSpan(ii, jj, 2))
+                                feasSpan(ii, jj, 2) = kk-1+n;
+                            end
+                        catch
+                            fprintf('uh oh (n=1)\n');
+                        end
+                        % last overall feasible actuator angle
+                        o = find(temp(n:end) < 1e-9, 1, 'first');
+                        if ~isempty(o)
+                            pass_soft(ii, jj, n+o:end) = 0;
+                            if isnan(feasSpan(ii, jj, 3))
+                                feasSpan(ii, jj, 3) = kk-1+n+o;
+                            end
+                            check(ii, jj) = 1;
+                        end % else do nothing
+                    end
+                else
+                    pass_soft(ii, jj, :) = 0;
+                end
+            end
+        end
+        
+        %% Assemble Omega
+        Omega1 = abs(lambda(1).*Nx./tau); % Force per actuator effort
+        Omega2 = abs(lambda(2).*Ny./tau); 
+        Omega_kk = (Omega1 + Omega2); % total mechanical advantage (without constraints)
+
+        j = j+1;
+        %% Accumulate Omega
+        if j==1
+            pass = pass_soft(:);
+            Omega = Omega_kk;
+        else
+            pass = vertcat(pass, pass_soft(:));
+            Omega = vertcat(Omega, Omega_kk);
+        end
+
+        %% how to reshape vectors back to meshgrids for inspection if needed
+        % tau = reshape(tau, M);
+    end
+    %% Finalize the mechanical advantage objective function
+    % max allowable gap between contact and feasible in rads
+    gap_max = deg2rad(1); 
+    % want 3 degrees. minimum allowable continuous span of feasibility in rads (divide be 2)
+    span_min = deg2rad(1.5); 
+    % convert to indices
+    gap_max = floor(gap_max./((th3(end)-th3(1))./numel(th3)));
+    span_min = ceil(span_min./((th3(end)-th3(1))./numel(th3)));
+    % if no start of feasibility is detected, replace nans with minimum th3
+    temp = feasSpan(:, :, 2);
+    temp(isnan(feasSpan(:, :, 2))) = 1;
+    feasSpan(:, :, 2) = temp;
+    % if no end of feasibility is detected, replace nans with maximum th3
+    temp = feasSpan(:, :, 3);
+    temp(isnan(feasSpan(:, :, 3))) = numel(th3); 
+    feasSpan(:, :, 3) = temp;
+    % make these domain-wide contraints soft
+    m = 1;
+    sd1 = feasSpan(:, :, 2) - feasSpan(:, :, 1);
+    sd1 = 1 ./ (1 + exp(-m .* (gap_max - sd1)));
+    sd2 = feasSpan(:, :, 3) - feasSpan(:, :, 2);
+    sd2 = 1 ./ (1 + exp(-m/5 .* (sd2 - span_min)));
+
+    % Reshape the pass and finalize objective function
+    pass = reshape(pass, numel(th1), numel(th2), []);
+    pass = pass.*(sd1.*sd2); 
+    Omega = reshape(Omega, numel(th1), numel(th2), []);
+    Omega = Omega.*pass; % ----- apply the constraints -----
+    % add limits to Omega for finite inverting later
+    Omega(Omega < 1e-9) = 1e-9; Omega(Omega > 1e9) = 1e9; 
+    % toc
+
+    %% Plots
+    % [th1s, th2s, th3s] = meshgrid(th1, th2, th3);
+    % figure(1) % Format Plot
+    % hold on
+    % pass_plot = pass; pass_plot(pass < 1e-12) = NaN;
+    % scatter3(th1s(:), th2s(:), th3s(:), 20*ones(size(th1s(:))), pass_plot(:), 'filled')
+    % xlabel('$\theta_1$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    % ylabel('$\theta_2$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    % zlabel('$\theta_3$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    % title('Soft Feasibility Plot', 'FontSize', 12)
+    % c = colorbar; c.Label.String = 'Feasibility Fraction'; c.FontSize = 12;
+    % clim([0 1]);
+    % colormap copper
+    % view(-35, 35)
+    % hold off
+    % figure(2) % Format Plot
+    % hold on
+    % Omega_plot = Omega; Omega_plot(pass < 0.05) = NaN;
+    % scatter3(th1s(:), th2s(:), th3s(:), 20*ones(size(th1s(:))), Omega_plot(:), 'filled')
+    % xlabel('$\theta_1$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    % ylabel('$\theta_2$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    % zlabel('$\theta_3$ (rad)', 'Interpreter', 'latex', 'FontSize', 12)
+    % title('Mechanical Advantage Plot (N/Nm)', 'FontSize', 12)
+    % c = colorbar; c.Label.String = 'N/Nm'; c.FontSize = 12;  
+    % clim([0 10]);
+    % colormap copper
+    % view(-35, 35)
+    % hold off
+
+    %% Average the mechanical advantage over all configurations -> make into scalar
+    % find the percentage of feasible actuator angles
+    n = mean(Omega > 1e-9, 3, 'omitnan');
+    sumOmega = sum(Omega, 3, 'omitnan');
+    % Sum the mechanical advantage over actuator angles and
+    % normalize by the fraction of feasible actuator angles. This
+    % will punish finger confiugurations with good mechanical
+    % advantage with low force observability.
+    objOmega = sumOmega.*n;
+    val = mean(objOmega, 'all', 'omitnan');
+    %% invert for minimization approach -> actautor effort per contact force (Nm/N)
+    val = 1./val;
+end
